@@ -6,11 +6,12 @@ use Data::Dumper;
 use POSIX qw(strftime);
 use Fatal qw(open);
 use bignum;
-use HTTP::Date;
 
-my $MINIMAL_IDLE_TO_REPORT = 100;
-my ( $OPTIONAL_HEADER, @HEADER_ELEMENTS ) = get_optional_header_re( '%m %u@%d %p %r ' );
-my $ANALYZE_DB = shift || '*';
+my $MINIMAL_IDLE_TO_REPORT = 1000;
+#my ( $OPTIONAL_HEADER, @HEADER_ELEMENTS ) = get_optional_header_re( '%m %u@%d %p %r ' );
+my ( $OPTIONAL_HEADER, @HEADER_ELEMENTS ) = get_optional_header_re( '%m\t%d\t%u\t%c\t%l\t%e\t' );
+my $NO_HEADER  = '\t\t\t\t\t\t';
+my $ANALYZE_DB = '*';
 my $COMMIT_SQL = qr{(?:COMMIT|ROLLBACK|END|ABORT)}i;
 my $BEGIN_SQL  = qr{(?:BEGIN|START)}i;
 
@@ -23,15 +24,17 @@ sub get_optional_header_re {
     my $prefix = shift;
 
     my %re = (
-        'u' => '[a-z0-9_]+',
-        'd' => '[a-z0-9_]+',
+        'u' => '(?:\[unknown\]|[[:alnum:]_]*)', # empty, [unknown], or username
+        'd' => '(?:\[unknown\]|[[:alnum:]_]*)', # empty, [unknown], or dbname
         'r' => '\d{1,3}(?:\.\d{1,3}){3}\(\d+\)|\[local\]',
         'h' => '\d{1,3}(?:\.\d{1,3}){3}|\[local\]',
         'p' => '\d+',
-        't' => '\d\d\d\d-\d\d-\d\d \d\d:\d\d:\d\d (?:[A-Z]+|\+\d\d\d\d)',
-        'm' => '\d\d\d\d-\d\d-\d\d \d\d:\d\d:\d\d\.\d+ (?:[A-Z]+|\+\d\d\d\d)',
-        'l' => '[A-Z]+',
+        't' => '\d\d\d\d-\d\d-\d\d \d\d:\d\d:\d\d \S+',
+        'm' => '\d\d\d\d-\d\d-\d\d \d\d:\d\d:\d\d\.\d+ \S+',
+        'l' => '\d+',
         'i' => '(?:BEGIN|COMMIT|DELETE|INSERT|ROLLBACK|SELECT|SET|SHOW|UPDATE)',
+	'e' => '\w{5}',
+	'c' => '[[:alnum:]]+\.[[:alnum:]]+',
     );
 
     my @known_keys = keys %re;
@@ -41,42 +44,49 @@ sub get_optional_header_re {
 
     $prefix =~ s/([()\[\]])/\\$1/g;
     $prefix =~ s/%($known_re)/push @matched, $1;'('.$re{$1}.')'/ge;
-    return $prefix, @matched;
+    return qr/^$prefix/, @matched;
 }
 
 sub parse_stdin {
     my $last = {};
     my $read = 0;
 
-    while ( my $line = <STDIN> ) {
+    while ( my $line = <> ) {
         chomp $line;
         $read++;
         print STDERR '#' if 0 == $read % 1000;
 
-        my @temp = $line =~ m/^$OPTIONAL_HEADER/i;
-        $line =~ s/^$OPTIONAL_HEADER//i;
+        my @temp;
         my %prefix;
-        @prefix{ @HEADER_ELEMENTS } = @temp;
+        if ( scalar( @temp = $line =~ m/$OPTIONAL_HEADER/ ) ) {
+	  $line =~ s/$OPTIONAL_HEADER//;
+	  @prefix{ @HEADER_ELEMENTS } = @temp;
+	#} elsif ( $line =~ s/^\t\s*// ) {
+	} else {
+	    # that's ok. continuation line.
+            next unless $last->{ 'time' };
+            $last->{ 'sql' } .= ' ' . $line;
+	    next;
+	}
 
-        if ( $line =~ m{ \A \s*  LOG: \s+ duration: \s+ (\d+\.\d+) \s+ ms \s+ (?: statement | execute[^:]* ): \s+ (.*?) \s* \z }xms ) {
+        if ( $line =~ m{ \A LOG: \s+ duration: \s+ (\d+\.\d+) \s+ ms \s+ ( statement | execute [^:]* ): \s+ (.*?) \s* \z }xms ) {
 
-            my ( $time, $sql ) = ( $1, $2 );
-            process_query( $last ) if $last->{ 'time' };
-            $last = {
-                'time'   => $time,
-                'sql'    => $sql,
-                'prefix' => \%prefix,
-            };
-
+            my ( $time, $mode, $sql ) = ( $1, $2, $3 );
+	    process_query( $last ) if $last->{ 'time' } ;
+	    $last = {
+		  'time'   => $time,
+		  'sql'    => $sql,
+		  'prefix' => \%prefix,
+	    };
+	    next;
         }
-        elsif ( $line =~ m{ \A \s* (?: LOG | NOTICE | HINT | DETAIL | WARNING | PANIC | ERROR ) : \s{1,2} }xms ) {
+        elsif ( $line =~ m{ \A (?: LOG | STATEMENT | NOTICE | HINT | DETAIL | FATAL | WARNING | PANIC | ERROR ) : \s{1,2} }xms ) {
             process_query( $last ) if $last->{ 'time' };
             $last = {};
             next;
         }
         else {
-            next unless $last->{ 'time' };
-            $last->{ 'sql' } .= ' ' . $line;
+	    warn "Unknown log line : $line";
         }
     }
     process_query( $last ) if $last->{ 'sql' };
@@ -92,13 +102,13 @@ sub process_query {
         return;
     }
     return unless $d->{ 'prefix' }->{ 'm' };
-    return unless $d->{ 'prefix' }->{ 'p' };
+    return unless ($d->{ 'prefix' }->{ 'p' } || $d->{ 'prefix' }->{ 'c' });
 
     my $end_time = get_ms_from_timestamp( $d->{ 'prefix' }->{ 'm' } );
     return unless $end_time;
     my $beginning_time = $end_time - $d->{ 'time' };
 
-    my $pid = $d->{ 'prefix' }->{ 'p' };
+    my $pid = ($d->{ 'prefix' }->{ 'p' } || $d->{ 'prefix' }->{ 'c' });
 
     if ( $pids{ $pid } ) {
         my $previous_end = $pids{ $pid }->{ 'last' };
@@ -128,7 +138,11 @@ sub process_query {
 }
 
 sub get_ms_from_timestamp {
+    use DateTime;
     my $timestamp = shift;
-    return unless $timestamp =~ m{\A(\d\d\d\d-\d\d-\d\d \d\d:\d\d:\d\d(?:\.\d{1,3})?)};
-    return 1000 * str2time( $1 );
+    return unless $timestamp =~ m{^(\d\d\d\d)-(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d)(?:\.(\d{1,3}))?(?: (\S+))?};
+    my $dt = DateTime->new( year=>$1,month=>$2,day=>$3,hour=>$4,minute=>$5,second=>$6,time_zone=>$8 );
+    # Hack to add milliseconds. If we use nanoscconds, the bignum module returns a 
+    # HASH which interferes with DateTime's validate() procedure, which expects a SCALAR
+    return $dt->epoch() * 1000 + $7;
 }
