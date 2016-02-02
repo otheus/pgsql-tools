@@ -6,19 +6,31 @@ use Data::Dumper;
 use POSIX qw(strftime);
 use Fatal qw(open);
 use bignum;
+use Getopt::Std;
 
-my $MINIMAL_IDLE_TO_REPORT = 1000;
-#my ( $OPTIONAL_HEADER, @HEADER_ELEMENTS ) = get_optional_header_re( '%m %u@%d %p %r ' );
-my ( $OPTIONAL_HEADER, @HEADER_ELEMENTS ) = get_optional_header_re( '%m\t%d\t%u\t%c\t%l\t%e\t' );
-my $NO_HEADER  = '\t\t\t\t\t\t';
-my $ANALYZE_DB = '*';
-my $COMMIT_SQL = qr{(?:COMMIT|ROLLBACK|END|ABORT)}i;
-my $BEGIN_SQL  = qr{(?:BEGIN|START)}i;
+our $COMMIT_SQL = qr{\b(?:COMMIT|ROLLBACK|ABORT)\s*;?\s*}i; # END removed.
+our $BEGIN_SQL  = qr{\b(?:BEGIN|START)\b}i;
+our $DML_SQL  = qr{\b(?:INSERT|UPDATE|DELETE)\b}i; # imperfect, but better than nothing
 
-my %pids = ();
-parse_stdin();
+our $opt_h = '%m\t%d\t%u\t%c\t%l\t%e\t'; # Prefix on each non-continuation log line
+our $opt_d = ''; # DB to analyze
+our $opt_t = 0;  # Max time in a transaction
+our $opt_T = 0;  # Max time between statements within a transaction
+ # ^ (not yet implemented)
+our $opt_x = 0;  # Log Xactions only?
+our $opt_m = 0;  # modifications (insert/update/delete) only?
+getopts('mxh:d:t:');
 
-exit;
+my ( $PREFIX, @PREFIX_ELEMENTS ) = get_optional_header_re( $opt_h ) ;
+die "Log prefix must contain at least a timestamp (%m), and session id (%c) or process id (%p)"
+  unless grep(/^m$/,@PREFIX_ELEMENTS) && grep (/^[cp]$/,@PREFIX_ELEMENTS);
+my $MINIMAL_IDLE_TO_REPORT = $opt_t;
+my @ANALYZE_DB = split(',\s*',$opt_d);
+
+our %sessions = ();
+exit !parse_input();
+
+#------------------------------------------------------------------------------------------------
 
 sub get_optional_header_re {
     my $prefix = shift;
@@ -47,93 +59,211 @@ sub get_optional_header_re {
     return qr/^$prefix/, @matched;
 }
 
-sub parse_stdin {
-    my $last = {};
-    my $read = 0;
+sub postmatch { 
+  # See http://www.perlmonks.org/?node_id=291363
+  substr($_[0],$+[0]); # same as $POSTMATCH, but faster
+}
+sub match {
+  substr( $_[0], $-[0], $+[0] - $-[0] )
+}
+sub prematch {
+  substr( $_[0], 0, $-[0] )
+}
+
+sub parse_input {
+    my $valid_input=0;
+    my $previous = {};
 
     while ( my $line = <> ) {
+        print STDERR '#' if 0 == $. % 1000;
         chomp $line;
-        $read++;
-        print STDERR '#' if 0 == $read % 1000;
+	my $statement="";
 
         my @temp;
         my %prefix;
-        if ( scalar( @temp = $line =~ m/$OPTIONAL_HEADER/ ) ) {
-	  $line =~ s/$OPTIONAL_HEADER//;
-	  @prefix{ @HEADER_ELEMENTS } = @temp;
-	#} elsif ( $line =~ s/^\t\s*// ) {
+        if ( scalar( @temp = $line =~ $PREFIX ) ) {
+	  $statement = postmatch($line); 
+	  @prefix{ @PREFIX_ELEMENTS } = @temp;
+	  $prefix{'_'}=($prefix{'c'}||$prefix{'p'});
 	} else {
 	    # that's ok. continuation line.
-            next unless $last->{ 'time' };
-            $last->{ 'sql' } .= ' ' . $line;
+	    if ( length $previous->{ 'sql' } ) { 
+	      $previous->{ 'sql' } .= ' ' . $line;
+	    }
+            elsif (length $previous->{ 'm' } ) { 
+	      # ignore - extended from prevous line ? DETAIL? ERROR? 
+	    }
+	    else { 
+	      warn "Unrecognized log line format";
+	    }
 	    next;
 	}
 
-        if ( $line =~ m{ \A LOG: \s+ duration: \s+ (\d+\.\d+) \s+ ms \s+ ( statement | execute [^:]* ): \s+ (.*?) \s* \z }xms ) {
-
-            my ( $time, $mode, $sql ) = ( $1, $2, $3 );
-	    process_query( $last ) if $last->{ 'time' } ;
-	    $last = {
-		  'time'   => $time,
-		  'sql'    => $sql,
-		  'prefix' => \%prefix,
+        if ( $statement =~ m{ \A LOG: \s+ duration: \s+ (\d+\.\d+) \s+ ms \s+ ( statement | execute [^:]* ): \s+ (.*?) \s* \z }xms ) {
+            my ( $duration, $phase, $sql ) = ( $1, $2, $3 );
+	    # Future: phase could be "parse" , "bind"
+	    process_query( $previous ) if $previous->{ 'sql' } ;
+	    $previous = {
+		  'duration'  => $duration,
+		  'sql'       => $sql,
+		  %prefix,
 	    };
 	    next;
         }
-        elsif ( $line =~ m{ \A (?: LOG | STATEMENT | NOTICE | HINT | DETAIL | FATAL | WARNING | PANIC | ERROR ) : \s{1,2} }xms ) {
-            process_query( $last ) if $last->{ 'time' };
-            $last = {};
-            next;
+
+        if ( $statement =~ m{ \A (?: LOG | STATEMENT | NOTICE | HINT | DETAIL | FATAL | WARNING | PANIC | ERROR ) : \s{1,2} }xms ) {
+            process_query( $previous ) if $previous->{ 'sql' };
+            $previous = { %prefix };
         }
+	elsif ($statement =~ m{ \A FATAL: \s+ the database system is shutting down \\}xms ) {
+	    process_query( $previous ) if $previous->{ 'sql' } ;
+	    $previous = {};
+	    flush_all_sessions();
+	}
+	elsif ( $statement =~ m{ \A LOG: \s+ disconnection: session time: (\d+:\d+:\d+\.\d+) }xms ) {
+	    process_query( $previous ) if $previous->{ 'sql' } ;
+	    $previous = {};
+	    flush_session( $previous->{'_'}, 1);
+	}
         else {
-	    warn "Unknown log line : $line";
+	    warn "Unrecognized statement format: $statement";
         }
     }
-    process_query( $last ) if $last->{ 'sql' };
-    return;
+    process_query( $previous ) if $previous->{ 'sql' };
+    flush_all_sessions();
+    return $valid_input;
 }
 
+sub reset_session { 
+  my $rh_session = shift;
+  my $timestamp = shift;
+  $rh_session->{ 'time' } = $timestamp; 
+  $rh_session->{ 'duration' } = 0.0;
+  $rh_session->{ 'maxidletime' } = 0.0;
+  $rh_session->{ 'xact' } = 0;
+  $rh_session->{ 'dml' } = 0;
+  $rh_session->{ 'queries' }=[];
+}
+
+sub flush_session {
+  my $sid = shift;
+  my $deleteit = shift;
+  if (exists $sessions{ $sid } ) { 
+    my $session = $sessions{ $sid };
+    my ($pid) = $sid =~ /(\d+)$/;
+    my $basetime = get_ms_from_timestamp( $session->{ 'time' } );
+    my $lasttime = $basetime;
+
+    if (scalar(@{$session->{ 'queries' }})) {
+      if (
+	  (!$opt_m || $session->{ 'dml' }) and
+	  (!$opt_x || $session->{ 'xact' }) and
+	  (!$opt_t || $session->{ 'duration' } > $opt_t)
+      ) { 
+	printf( "%s [%d] \"%s\" total duration: %.2f ms\n",  $session->{ 'time' }, $sid, ($session->{ 'dbname' } || "-"), $session->{ 'duration' } );
+	foreach (@{$session->{ 'queries' }}) { 
+	  my ($querytime,$duration,$sql)= @{$_};
+	  my $starttime = get_ms_from_timestamp( $querytime );
+	  #printf(" +%6dms %5.1fms: %s\n",($starttime - $basetime),int($duration * 1000),$sql);
+	  printf(" +%6dms %6.2fms: %s\n",($starttime - $basetime),$duration,$sql);
+	  $lasttime = $querytime;
+	}
+	print "\n";
+      }
+      reset_session( $session, $lasttime );
+    }
+    delete $session->{ $sid } if $deleteit;
+  }
+}
+
+#    my $previous_end = $sessions{ $sid }->{ 'last' };
+#    if ( $beginning_time - $previous_end >= $MINIMAL_IDLE_TO_REPORT ) {
+#    printf( "%ums @ %s (pid: %s), queries:\n", $beginning_time - $previous_end, $d->{ 'prefix' }->{ 'm' }, $sid );
+#    print "  - $_\n" for ( @{ $sessions{ $sid }->{ 'queries' } }, $d->{ 'sql' } );
+#    print "\n";
+#    }
+sub flush_all_sessions { 
+  foreach (keys %sessions) { 
+    flush_session($_,1);
+  }
+}
+
+#
+sub add_query {
+  my $rh_session = shift;
+  my ($m, $duration, $sql) = @_;
+  if ('ARRAY' ne ref $rh_session->{ 'queries' } ) {
+    $rh_session->{ 'queries' } = [];
+  }
+  if (0 == scalar(@{$rh_session->{'queries'}})) { 
+    $rh_session->{'time'} = $m;
+    $rh_session->{'duration'} = $duration;
+  }
+
+  $rh_session->{ 'xact' } = 1 if $sql =~ $BEGIN_SQL;
+  $rh_session->{ 'dml' } = 1 if $sql =~ $DML_SQL;
+
+  push @{$rh_session->{'queries'}},[ $m, $duration, $sql ];
+}
+
+
+# 
+# process_query
+#
+# When we get a complete query, append it and timing info to the list of queries
+# for the given session. If the session is new, initialize it, with the 
+# starting time, dbname; accumulate total duration.
+# 
+# If the query includes a commit string, split the query, flush the session
+# 
 sub process_query {
     my $d = shift;
-    if (   ( $ANALYZE_DB )
-        && ( $ANALYZE_DB ne '*' )
-        && ( $d->{ 'prefix' }->{ 'd' } ne $ANALYZE_DB ) )
-    {
-        return;
-    }
-    return unless $d->{ 'prefix' }->{ 'm' };
-    return unless ($d->{ 'prefix' }->{ 'p' } || $d->{ 'prefix' }->{ 'c' });
+    my $sid = $d->{_};
+    return unless $sid;
+    return unless $d->{ 'm' };
+    return unless !scalar(@ANALYZE_DB) || grep { $_ eq $d->{ 'd' } } @ANALYZE_DB;
+    my $sql = $d->{ 'sql' };
 
-    my $end_time = get_ms_from_timestamp( $d->{ 'prefix' }->{ 'm' } );
-    return unless $end_time;
-    my $beginning_time = $end_time - $d->{ 'time' };
+    # my $end_time = get_ms_from_timestamp( $d->{ 'm' } );
+    # return unless $end_time;
+    # my $beginning_time = $end_time - $d->{ 'duration' };
 
-    my $pid = ($d->{ 'prefix' }->{ 'p' } || $d->{ 'prefix' }->{ 'c' });
+    if (!$sessions{ $sid } ) {
+	$sessions{ $sid } = { };
+	$sessions{ $sid }->{ 'dbname' } = $d->{ 'd' } if $d->{'d'};
+	reset_session($sessions{ $sid }, $d->{ 'm' });
+    }
 
-    if ( $pids{ $pid } ) {
-        my $previous_end = $pids{ $pid }->{ 'last' };
-        if ( $beginning_time - $previous_end >= $MINIMAL_IDLE_TO_REPORT ) {
-            printf( "%ums @ %s (pid: %s), queries:\n", $beginning_time - $previous_end, $d->{ 'prefix' }->{ 'm' }, $pid );
-            print "  - $_\n" for ( @{ $pids{ $pid }->{ 'queries' } }, $d->{ 'sql' } );
-            print "\n";
-        }
+    $sessions{ $sid }->{ 'duration' } += $d->{ 'duration' };
+
+    # A commit might "Split" the current query 
+    # For reporting, we output the queries per-transaction
+    if ($sql =~ $COMMIT_SQL)  {
+      my ($xact_prev, $xact_curr) = (prematch($sql) . match($sql), postmatch($sql));
+      add_query( $sessions{$sid}, $d->{'m'}, $d->{'duration'}, $xact_prev);
+
+      if (length($xact_curr)) {
+	flush_session( $sid, 0 );
+	add_query( $sessions{$sid}, $d->{'m'}, 0.0, $xact_curr);
+      }
+      else {
+	flush_session( $sid, 1 );
+      }
     }
-    if ( $d->{ 'sql' } =~ m{\A\s*$COMMIT_SQL\s*;?\s*\z} ) {
-        delete $pids{ $pid };
-        return;
+    else { 
+      add_query( $sessions{ $sid }, $d->{ 'm' }, $d->{ 'duration' }, $d->{ 'sql' } );
     }
-    my $qr = qr{\A\s*(?:$COMMIT_SQL\s*;\s*)?$BEGIN_SQL\s*;?\s*\z};
-    if ( $d->{ 'sql' } =~ m{\A\s*(?:$COMMIT_SQL\s*;\s*)?$BEGIN_SQL\s*;?\s*\z} ) {
-        $pids{ $pid } = {
-            'last'    => $end_time,
-            'queries' => [ $d->{ 'sql' } ],
-        };
-        return;
-    }
-    if ( $pids{ $pid } ) {
-        $pids{ $pid }->{ 'last' } = $end_time;
-        push @{ $pids{ $pid }->{ 'queries' } }, $d->{ 'sql' };
-    }
+
+    # I don't understand this code:
+    ##  my $qr = qr{\A\s*(?:$COMMIT_SQL\s*;\s*)?$BEGIN_SQL\s*;?\s*\z};
+    ## if ( $d->{ 'sql' } =~ m{\A\s*(?:$COMMIT_SQL\s*;\s*)?$BEGIN_SQL\s*;?\s*\z} ) {
+    ##     $sessions{ $sid } = {
+    ##         'last'    => $end_time,
+    ##         'queries' => [ $d->{ 'sql' } ],
+    ##     };
+    ##     return;
+    ## }
+
     return;
 }
 
