@@ -19,7 +19,7 @@ It's highly recommended that:
  * Size-based rotation is enabled
  * An external log capturer or rotator is used to ensure the disk doesn't get full. I use `runit`'s `svlogd` utility.
  
-#### Usage:  <program> [options] [logfile ... ]
+#### Usage: `<program> [options] [logfile ... ]`
 
 Where `options` are one of 
 * `-p`  Specify string used with `log_line_prefix`
