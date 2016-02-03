@@ -23,7 +23,7 @@ It's highly recommended that:
 
 Where `options` are one of 
 * `-p`  Specify string used with `log_line_prefix`
-* `-d`  Comma-list of database names to analyze (excluding others). Replaces command-line parameter from main branch. `*` is no longer magical, and a blank or empty string means "all".
+* `-d`  Comma-list of database names to analyze (excluding others). Replaces command-line parameter from main branch. The `*` is no longer magical, and a blank or empty string means "all".
 * `-t`  Specifies the (minimum) threshold for reporting of the *t*ime in a transaction.
 * `-x`  Report only on transactions (*x*actions), ie, `BEGIN ... COMMIT` or ending in `ROLLBACK` or disconnection.
 * `-m`  Report only on sessions/transactions with DML (insert/update/delete)
