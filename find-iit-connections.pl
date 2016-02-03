@@ -12,16 +12,16 @@ our $COMMIT_SQL = qr{\b(?:COMMIT|ROLLBACK|ABORT)\s*;?\s*}i; # END removed.
 our $BEGIN_SQL  = qr{\b(?:BEGIN|START)\b}i;
 our $DML_SQL  = qr{\b(?:INSERT|UPDATE|DELETE)\b}i; # imperfect, but better than nothing
 
-our $opt_h = '%m\t%d\t%u\t%c\t%l\t%e\t'; # Prefix on each non-continuation log line
+our $opt_p = '%m\t%d\t%u\t%c\t%l\t%e\t'; # Prefix on each non-continuation log line
 our $opt_d = ''; # DB to analyze
 our $opt_t = 0;  # Max time in a transaction
 our $opt_T = 0;  # Max time between statements within a transaction
  # ^ (not yet implemented)
 our $opt_x = 0;  # Log Xactions only?
 our $opt_m = 0;  # modifications (insert/update/delete) only?
-getopts('mxh:d:t:');
+getopts('mxp:d:t:');
 
-my ( $PREFIX, @PREFIX_ELEMENTS ) = get_optional_header_re( $opt_h ) ;
+my ( $PREFIX, @PREFIX_ELEMENTS ) = get_optional_header_re( $opt_p ) ;
 die "Log prefix must contain at least a timestamp (%m), and session id (%c) or process id (%p)"
   unless grep(/^m$/,@PREFIX_ELEMENTS) && grep (/^[cp]$/,@PREFIX_ELEMENTS);
 my $MINIMAL_IDLE_TO_REPORT = $opt_t;
